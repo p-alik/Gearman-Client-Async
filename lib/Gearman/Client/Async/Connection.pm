@@ -35,7 +35,8 @@ use Gearman::Job::Async;
 use Scalar::Util qw(weaken);
 
 use IO::Handle;
-use Socket qw(PF_INET IPPROTO_TCP TCP_NODELAY SOL_SOCKET SOCK_STREAM);
+use Socket qw(PF_INET IPPROTO_TCP TCP_NODELAY SOL_SOCKET SOCK_STREAM SO_ERROR);
+use Errno qw(EINPROGRESS EWOULDBLOCK EAGAIN);
 
 sub DEBUGGING () { 0 }
 
@@ -138,12 +139,17 @@ sub connect {
     $self->SUPER::new( $sock );
     $self->{parser} = Gearman::ResponseParser::Async->new( $self );
 
-    eval {
+    my $rv = eval {
         connect $sock, Socket::sockaddr_in($port, Socket::inet_aton($host));
     };
     if ($@) {
         $self->on_connect_error;
         return;
+    } elsif (!$rv) {
+        unless ($! == EINPROGRESS || $! == EWOULDBLOCK || $! == EAGAIN || $! == 0) {
+            warn "Error on connect: $!\n" if DEBUGGING;
+            $self->on_connect_error;
+        }
     }
 
     Danga::Socket->AddTimer(0.25, sub {
@@ -163,6 +169,12 @@ sub event_write {
     my Gearman::Client::Async::Connection $self = shift;
 
     if ($self->{state} == S_CONNECTING) {
+        if (my $error = unpack('i', getsockopt($self->{sock}, SOL_SOCKET, SO_ERROR))) {
+            local $! = $error;
+            warn "Error during write state after connect: $!\n" if DEBUGGING;
+            $self->on_connect_error;
+            return;
+        }
         $self->{state} = S_READY;
         $self->watch_read(1);
         warn "$self->{hostspec} connected and ready.\n" if DEBUGGING;

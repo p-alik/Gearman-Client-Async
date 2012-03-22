@@ -1,3 +1,5 @@
+    -- Add better error handling for connection failures.
+
     -- Add exceptions support to Async client
 
 0.94 (2007-05-17)
