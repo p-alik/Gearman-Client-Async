@@ -15,11 +15,7 @@ use fields (
             'task2handle', # hashref of stringified Task -> scalar handle
             'on_ready',    # arrayref of on_ready callbacks to run on connect success
             'on_error',    # arrayref of on_error callbacks to run on connect failure
-            'options',     # hashref of options associated with this connection and their value
-            'requests',    # arrayref of outstanding requests to line up with results or errors
             't_offline',   # bool: fake being off the net for purposes of connecting, to force timeout
-            'worker_funcs',# hashref of name -> CODE for worker functions this client supports
-            'is_worker',   # bool indicating whether this client acts as a worker
             );
 
 our $T_ON_TIMEOUT;
@@ -31,12 +27,10 @@ use constant S_READY        => \ "ready";
 use Carp qw(croak);
 use Gearman::Task;
 use Gearman::Util;
-use Gearman::Job::Async;
 use Scalar::Util qw(weaken);
 
 use IO::Handle;
-use Socket qw(PF_INET IPPROTO_TCP TCP_NODELAY SOL_SOCKET SOCK_STREAM SO_ERROR);
-use Errno qw(EINPROGRESS EWOULDBLOCK EAGAIN);
+use Socket qw(PF_INET IPPROTO_TCP TCP_NODELAY SOL_SOCKET SOCK_STREAM);
 
 sub DEBUGGING () { 0 }
 
@@ -66,7 +60,7 @@ sub new {
         $self->{state}       = S_CONNECTING;
         $self->{parser} = Gearman::ResponseParser::Async->new( $self );
         $self->watch_write(1);
-    } else {
+    }else {
         $self->{state}       = S_DISCONNECTED;
     }
 
@@ -77,33 +71,9 @@ sub new {
     $self->{on_ready}    = [];
     $self->{on_error}    = [];
     $self->{task2handle} = {};
-    $self->{options}     = {};
-    $self->{requests}    = [];
-    $self->{worker_funcs} = {};
-    $self->{is_worker} = 0;
-
-    if (my $val = delete $opts{exceptions}) {
-        $self->{options}->{exceptions} = $val;
-    }
 
     croak "Unknown parameters: " . join(", ", keys %opts) if %opts;
     return $self;
-}
-
-sub as_string {
-    my Gearman::Client::Async::Connection $self = shift;
-
-    my $hostspec = $self->{hostspec};
-
-    my $waiting     = $self->{waiting};
-    my $need_handle = $self->{need_handle};
-    my $requests    = $self->{requests};
-
-    return sprintf("%s(%d,%d,%d)", $hostspec,
-        scalar keys %$waiting,
-        scalar @$need_handle,
-        scalar @$requests,
-    );
 }
 
 sub close_when_finished {
@@ -122,7 +92,7 @@ sub connect {
 
     $self->{state} = S_CONNECTING;
 
-    my ($host, $port) = split /:/, $self->{hostspec}; # /
+    my ($host, $port) = split /:/, $self->{hostspec};
     $port ||= 7003;
 
     warn "Connecting to $self->{hostspec}\n" if DEBUGGING;
@@ -139,17 +109,12 @@ sub connect {
     $self->SUPER::new( $sock );
     $self->{parser} = Gearman::ResponseParser::Async->new( $self );
 
-    my $rv = eval {
+    eval {
         connect $sock, Socket::sockaddr_in($port, Socket::inet_aton($host));
     };
     if ($@) {
         $self->on_connect_error;
         return;
-    } elsif (!$rv) {
-        unless ($! == EINPROGRESS || $! == EWOULDBLOCK || $! == EAGAIN || $! == 0) {
-            warn "Error on connect: $!\n" if DEBUGGING;
-            $self->on_connect_error;
-        }
     }
 
     Danga::Socket->AddTimer(0.25, sub {
@@ -169,26 +134,11 @@ sub event_write {
     my Gearman::Client::Async::Connection $self = shift;
 
     if ($self->{state} == S_CONNECTING) {
-        if (my $error = unpack('i', getsockopt($self->{sock}, SOL_SOCKET, SO_ERROR))) {
-            local $! = $error;
-            warn "Error during write state after connect: $!\n" if DEBUGGING;
-            $self->on_connect_error;
-            return;
-        }
         $self->{state} = S_READY;
         $self->watch_read(1);
         warn "$self->{hostspec} connected and ready.\n" if DEBUGGING;
         $_->() foreach @{$self->{on_ready}};
         $self->destroy_callbacks;
-
-        my $options = $self->{options};
-        my $requests = $self->{requests};
-
-        foreach my $option (keys %$options) {
-            my $req = Gearman::Util::pack_req_command("option_req", $option);
-            $self->write($req);
-            push @$requests, $option;
-        }
     }
 
     $self->watch_write(0) if $self->write(undef);
@@ -275,94 +225,9 @@ sub add_task {
     Scalar::Util::weaken($self->{need_handle}->[-1]);
 }
 
-sub register_function {
-    my Gearman::Client::Async::Connection $self = shift;
-    my $func_name = shift;
-    my $code = shift;
-
-    warn "Registered worker function $func_name\n" if DEBUGGING;
-
-    $self->{worker_funcs}{$func_name} = $code;
-
-    my $req = Gearman::Util::pack_req_command("can_do", $func_name);
-    $self->write( $req );
-
-    $self->start_worker();
-
-}
-
-sub start_worker {
-    my Gearman::Client::Async::Connection $self = shift;
-
-    unless ($self->{is_worker}) {
-        warn "Becoming a worker\n" if DEBUGGING;
-        $self->{is_worker} = 1;
-        $self->request_job();
-    }
-}
-
-sub request_job {
-    my Gearman::Client::Async::Connection $self = shift;
-
-    warn "Requesting a job\n" if DEBUGGING;
-    my $req = Gearman::Util::pack_req_command("grab_job");
-    $self->write( $req );
-}
-
-sub announce_sleep {
-    my Gearman::Client::Async::Connection $self = shift;
-
-    warn "Telling server that our worker is sleeping\n" if DEBUGGING;
-    my $req = Gearman::Util::pack_req_command("pre_sleep");
-    $self->write( $req );
-}
-
-sub announce_job_status {
-    my Gearman::Client::Async::Connection $self = shift;
-    my $job_handle = shift;
-    my $nu = shift;
-    my $de = shift;
-
-    warn "Job $job_handle has status $nu/$de\n" if DEBUGGING;
-
-    my $arg = join("\0", $job_handle, $nu, $de);
-    my $req = Gearman::Util::pack_req_command("work_status", $arg);
-    $self->write( $req );
-}
-
-sub announce_job_complete {
-    my Gearman::Client::Async::Connection $self = shift;
-    my $job_handle = shift;
-    my $ret_ref = shift;
-
-    warn "Job $job_handle completed successfully\n" if DEBUGGING;
-
-    my $arg = join("\0", $job_handle, $$ret_ref);
-    my $req = Gearman::Util::pack_req_command("work_complete", $arg);
-    $self->write( $req );
-}
-
-sub announce_job_fail {
-    my Gearman::Client::Async::Connection $self = shift;
-    my $job_handle = shift;
-
-    warn "Job $job_handle failed\n" if DEBUGGING;
-
-    my $req = Gearman::Util::pack_req_command("work_fail", $job_handle);
-    $self->write( $req );
-}
-
-sub is_worker {
-    my Gearman::Client::Async::Connection $self = shift;
-
-    return $self->{is_worker};
-}
-
 sub stuff_outstanding {
     my Gearman::Client::Async::Connection $self = shift;
     return
-        @{$self->{on_ready}} ||
-        @{$self->{on_error}} ||
         @{$self->{need_handle}} ||
         %{$self->{waiting}};
 }
@@ -413,7 +278,6 @@ sub process_packet {
 
     if ($res->{type} eq "work_fail") {
         my $shandle = ${ $res->{'blobref'} };
-        warn "Job failure: $shandle\n" if DEBUGGING;
         $self->_fail_jshandle($shandle);
         return 1;
     }
@@ -452,89 +316,6 @@ sub process_packet {
         }
 
         return 1;
-    }
-
-    if ($res->{type} eq "work_exception") {
-        ${ $res->{'blobref'} } =~ s/^(.+?)\0//
-            or die "Bogus work_complete from server";
-        my $shandle = $1;
-
-
-        my $task_list = $self->{waiting}{$shandle} or
-            return;
-
-        my Gearman::Task $task = $task_list->[0] or
-            return;
-
-        $task->exception($res->{'blobref'});
-
-        return 1;
-    }
-
-    if ($res->{type} eq "error") {
-        my $requests = $self->{requests};
-
-        if (@$requests) {
-            my $request = shift @$requests;
-            delete $self->{options}->{$request};
-            warn "Request for option '$request' failed. Removing option\n" if DEBUGGING;
-            return 1;
-        }
-    }
-
-    if ($res->{type} eq "option_res") {
-        my $requests = $self->{requests};
-
-        if (@$requests) {
-            my $request = shift @$requests;
-            warn "Request for option '$request' success.\n" if DEBUGGING;
-            return 1;
-        }
-    }
-
-    if ($self->is_worker) {
-
-        if ($res->{type} eq 'no_job') {
-            warn "No job for us to do.\n" if DEBUGGING;
-            # Go to sleep.
-            $self->announce_sleep();
-            return 1;
-        }
-
-        if ($res->{type} eq 'job_assign') {
-            ${ $res->{'blobref'} } =~ s/^(.+?)\0(.+?)\0// or die "Uh, regexp on job_assign failed";
-            my ($handle, $func) = ($1, $2);
-            my $code = $self->{worker_funcs}{$func};
-
-            warn "Assigned job $handle for function $func\n" if DEBUGGING;
-
-            if ($code) {
-                my $job = Gearman::Job::Async->new($func, $res->{'blobref'}, $handle, $self);
-                warn "Calling handler for $func...\n" if DEBUGGING;
-                $code->($job);
-            }
-            else {
-                warn "I don't know how to handle the function $func\n" if DEBUGGING;
-
-                # Job server has given us a job we can't handle, so fail.
-                $self->announce_job_fail($handle);
-            }
-
-            # While we're handling that job we can also handle additional jobs,
-            # since the job must be async.
-            $self->request_job();
-
-            return 1;
-        }
-
-        if ($res->{type} eq 'noop') {
-            # Assume we've just been woken up from sleep to perform work.
-            warn "Recieved no-op request. Waking up.\n" if DEBUGGING;
-            $self->request_job();
-
-            return 1;
-        }
-
     }
 
     die "Unknown/unimplemented packet type: $res->{type}";

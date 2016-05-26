@@ -24,18 +24,5 @@ $worker->register_function("sleep_for" => sub {
     return $res;
 });
 
-$worker->register_function("throw_exception" => sub {
-    my $job = shift;
-    my $arg = $job->arg;
-
-    die $arg;
-});
-
-my $running = 1;
-
-$worker->register_function("shutdown" => sub {
-    $running = 0;
-});
-
-$worker->work while $running;
+$worker->work while 1;
 
