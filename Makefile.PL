@@ -25,5 +25,19 @@ WriteMakefile(
     AUTHOR =>
         'Brad Fitzpatrick (brad@danga.org), Jonathan Steinert (hachi@cpan.org)',
     ABSTRACT_FROM => 'lib/Gearman/Client/Async.pm',
+    META_MERGE => {
+        'meta-spec' => { version => 2 },
+        resources   => {
+            bugtracker =>
+                { web => 'https://github.com/p-alik/Gearman-Client-Async/issues' },
+            repository => {
+                type => 'git',
+                url  => 'https://github.com/p-alik/Gearman-Client-Async.git',
+                web  => 'https://github.com/p-alik/Gearman-Client-Async',
+            },
+        },
+    },
+    dist  => { COMPRESS => "gzip -9f", SUFFIX => "gz", },
+    clean => { FILES    => "Gearman-Client-Async-*" },
 );
 
